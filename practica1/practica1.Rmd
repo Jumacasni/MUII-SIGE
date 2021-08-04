@@ -1,0 +1,477 @@
+---
+title: 'Práctica 1: Pre-procesamiento de datos y clasificación binaria'
+author: "Juan Manuel Castillo Nievas"
+date: "6 de abril de 2021"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+  html_document:
+    code_folding: show
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Lectura y visualización de los datos
+
+```{r lectura de datos}
+library(tidyverse)
+training_data_raw <- read_csv('training.csv')
+training_data_raw
+```
+
+```{r}
+# Codificar valores perdidos y convertir variable clasificadora en factor
+# 1 -> bosón, 0 -> ruido
+training_data <- training_data_raw %>%
+  mutate(Label = as.factor(ifelse(Label == 's', 1, 0))) %>%
+  na_if(-999.0)
+
+# Identificar valores perdidos y otra información
+library(funModeling)
+status <- df_status(training_data)
+
+# Visualización de la variable clasificadora
+ggplot(training_data %>% mutate(Label = ifelse(Label == 1, "bosón", "ruido"))) + 
+  geom_histogram(aes(x = Label, fill = Label), stat = 'count')
+```
+
+```{r resumen}
+summary(training_data)
+```
+
+# Imputación de valores perdidos
+```{r}
+library(mice)
+# Imputar valores perdidos
+imputation <- mice(training_data,
+                   method = c("","mean","","","","mean","mean","mean","","","",
+                                "","","mean","","","","","","","","","","","mean",
+                              "mean","mean","mean","mean","mean","","",""))
+
+training_data <- complete(imputation)
+```
+
+# Selección de variables
+
+Se eliminan las columnas que tienen más de un 70% de valores únicos.
+
+```{r }
+# Comprobar de nuevo df_status
+df_status(training_data)
+
+# Identificar columnas que tienen más de un 70% de valores únicos
+dif_cols <- status %>%
+  filter(unique > 0.7 * nrow(training_data)) %>%
+  select(variable)
+
+# Eliminar columnas
+remove_cols <- bind_rows(
+  list(dif_cols)
+)
+training_data_clean <- training_data %>%
+  select(-one_of(remove_cols$variable))
+```
+
+Se han hecho dos métodos. El primer método hace una selección de variables a partir
+de las correlaciones. El segundo método hace una selección de variables a partir
+de la importancia de las variables con un modelo de predicción.
+
+## Correlaciones
+
+### Alta correlación con la variable objetivo
+
+La idea es quedarse con aquellas variables que sean buenos predictores de la
+variable objetivo.
+
+```{r correlaciones}
+# Eliminar filas con valores perdidos y convertir en numérico los factores
+# (la variable clasificadora)
+training_data_num <- training_data_clean %>%
+  na.exclude() %>%
+  mutate_if(is.factor, as.numeric)
+
+# Crear tabla de correlación
+cor_target <- correlation_table(training_data_num, target='Label')
+cor_target
+
+# Quedarse con aquellas variables que su correlación es >= 0.05
+important_vars <- cor_target %>% 
+  filter(abs(Label) >= 0.05)
+training_data1 <- training_data_clean %>%
+  select(one_of(important_vars$Variable))
+```
+
+### Alta correlación entre sí
+
+La idea es eliminar variables que ofrezcan una información muy similar a otras.
+
+```{r correlaciones}
+library(corrplot)
+
+# Eliminar filas con valores perdidos y convertir en numérico los factores
+# (la variable clasificadora)
+training_data_num <- training_data1 %>%
+  na.exclude() %>%
+  mutate_if(is.factor, as.numeric)
+
+# Crear tabla de correlación
+rcorr_result <- rcorr(as.matrix(training_data_num))
+
+# Visualizar tabla de correlación
+cor_matrix <- as_tibble(rcorr_result$r, rownames = "variable")
+corrplot(rcorr_result$r, order = "original", tl.col = "black", tl.srt = 45)
+
+# Cluster jerárquico a partir de la similitud de las variables
+v <- varclus(as.matrix(training_data_num), similarity="pearson")
+plot(v)
+
+# Cortar el cluster jerárquico obteniendo 10 grupos
+groups <- cutree(v$hclust, k = 10)
+
+# Quedarse con una variable representativa de cada grupo
+not_correlated_vars <- enframe(groups) %>% 
+  group_by(value) %>% 
+  sample_n(1)
+training_data1 <- training_data1 %>%
+  select(one_of(not_correlated_vars$name))
+```
+
+## Importancia de las variables con modelo de predicción
+
+Se entrena un modelo de predicción y se evalúan cuáles son aquellas variables
+que el predictor tiene en cuenta con más importancia.
+
+```{r importancia variables}
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+
+# Preprocesamiento
+training_data2 <-
+  training_data_clean %>%
+  mutate(Label = as.factor(ifelse(Label == 0, 'No', 'Yes'))) %>%
+  na.exclude()
+
+# Parámetros
+rpartCtrl <- trainControl(verboseIter = F, classProbs = TRUE, summaryFunction = twoClassSummary)
+rpartParametersGrid <- expand.grid(.cp = 0.01)
+
+# Conjuntos de entrenamiento y validación
+trainIndex <- createDataPartition(training_data2$Label, p = .8, list = FALSE, times = 1)
+train <- training_data2[trainIndex, ] 
+
+# Entrenamiento del modelo
+rpartModel <- train(Label ~ ., 
+                    data = train, 
+                    method = "rpart", 
+                    metric = "ROC", 
+                    trControl = rpartCtrl, 
+                    tuneGrid = rpartParametersGrid)
+
+# Visualización del modelo
+rpart.plot(rpartModel$finalModel)
+
+# Predicciones con clases
+val <- training_data2[-trainIndex, ]
+prediction <- predict(rpartModel, val, type = "raw") 
+
+# Predicciones con probabilidades
+predictionValidationProb <- predict(rpartModel, val, type = "prob")
+
+# Matriz de confusión
+cm_train <- confusionMatrix(prediction, val[["Label"]])
+cm_train
+
+# Curva ROC
+auc <- roc(val$Label, predictionValidationProb[["Yes"]], levels = unique(val[["Label"]]))
+roc_validation <- plot.roc(auc, 
+                           ylim=c(0,1), 
+                           type = "S" , 
+                           print.thres = TRUE, 
+                           main=paste('Validation AUC:', round(auc$auc[[1]], 2)))
+
+# Importancia de las variables
+varImp(rpartModel)
+
+# Quedarse con las variables cuyo Overall > 50
+important_vars <- varImp(rpartModel)$importance %>%
+  rownames_to_column() %>%
+  filter(Overall > 50) %>%
+  select(rowname)
+training_data2 <- training_data_clean %>%
+  select(one_of(important_vars$rowname), Label)
+```
+
+# Detección de conflictos e inconsistencias en los datos
+
+
+Esto se ha aplicado al conjunto de datos training_data2
+
+```{r}
+# Diagrama de cajas y bigotes
+g_caja<-boxplot(training_data2$Weight, col="skyblue", frame.plot=F)
+
+# Eliminar outliers
+training_data2<-training_data2[!(training_data2$Weight %in% g_caja$out),]
+
+# Volver a visualizar el diagrama de cajas y bigotes
+boxplot(training_data2$Weight, col="skyblue", frame.plot=F)
+```
+
+# Tratamiendo de clases no balanceadas
+
+## Conjunto de entrenamiento y validación
+
+Antes de aplicar downsampling, obtengo el conjunto de validación de ambos
+conjuntos de datos ya preprocesados.
+
+```{r}
+
+# Conjunto de entrenamiento y validación de training_data1
+# pasa a ser train1
+train1 <- training_data1 %>%
+  head(round(0.8 * nrow(training_data1)))
+val1 <- training_data1 %>%
+  tail(round(0.2 * nrow(training_data1))) %>%
+  mutate(Label = as.factor(ifelse(Label == 1, 'Yes', 'No')))
+
+# Conjunto de entrenamiento y validación de training_data2
+# pasa a ser train2
+train2 <- training_data2 %>%
+  head(round(0.8 * nrow(training_data2)))
+val2 <- training_data2 %>%
+  tail(round(0.2 * nrow(training_data2))) %>%
+  mutate(Label = as.factor(ifelse(Label == 1, 'Yes', 'No')))
+
+```
+
+## Downsampling con train1
+
+```{r}
+
+# Crear dataset reducido con downsampling
+predictors <- select(train1, -Label)
+training_data1_down <- downSample(x = predictors, y = train1$Label, yname = 'Label')
+
+table(training_data1_down$Label)
+
+```
+
+## Downsampling con train2
+
+```{r}
+
+# Crear dataset reducido con downsampling
+predictors <- select(train2, -Label)
+training_data2_down <- downSample(x = predictors, y = train2$Label, yname = 'Label')
+
+table(training_data2_down$Label)
+
+ggplot(training_data2_down %>% mutate(Label = ifelse(Label == 1, "bosón", "ruido"))) + 
+  geom_histogram(aes(x = Label, fill = Label), stat = 'count')
+```
+
+# Clasificación
+
+Se van a aplicar dos técnicas: CART y kNN.
+
+## Conjunto de entrenamiento y validación
+
+Primero se hacen los conjuntos de entrenamiento y validación de los tres
+conjuntos de datos
+
+```{r}
+set.seed(1234)
+# Partición de training_data, pasa a ser train
+trainIndex <- createDataPartition(training_data$Label, p = .8, list = FALSE, times = 1)
+train <- training_data[ trainIndex, ]
+train <- na.exclude(train) %>%
+        mutate(Label = as.factor(ifelse(Label == 1, 'Yes', 'No')))
+val <- training_data[-trainIndex, ]
+val <- na.exclude(val) %>%
+        mutate(Label = as.factor(ifelse(Label == 1, 'Yes', 'No')))
+
+# Partición de train1, pasa a ser train1_down
+trainIndex <- createDataPartition(training_data1_down$Label, p = .8, list = FALSE, times = 1)
+train1_down <- training_data1_down[ trainIndex, ] %>%
+        mutate(Label = as.factor(ifelse(Label == 1, 'Yes', 'No')))
+
+# Partición de train2, pasa a ser train2_down
+trainIndex <- createDataPartition(training_data2_down$Label, p = .8, list = FALSE, times = 1)
+train2_down <- training_data2_down[ trainIndex, ] %>%
+        mutate(Label = as.factor(ifelse(Label == 1, 'Yes', 'No')))
+```
+
+## CART
+
+Técnica de árboles de regresión.
+
+## Parámetros del algoritmo de aprendizaje
+
+Se definen los parámetros del algoritmo CART (la complejidad del árbol).
+
+```{r}
+rpartCtrl <- trainControl(classProbs = TRUE)
+rpartParametersGrid <- expand.grid(.cp = c(0.01, 0.05))
+```
+
+### Conjunto de datos train
+
+```{r}
+# Entrenar modelo
+rpartModel <- train(Label ~ ., 
+                    data = train, 
+                    method = "rpart", 
+                    metric = "Accuracy", 
+                    trControl = rpartCtrl, 
+                    tuneGrid = rpartParametersGrid)
+
+# Predicciones con clases
+prediction <- predict(rpartModel, val, type = "raw") 
+
+# Predicciones con probabilidades
+predictionValidationProb <- predict(rpartModel, val, type = "prob")
+
+# Matriz de confusión
+cm_train <- confusionMatrix(prediction, val[["Label"]])
+cm_train
+
+# Curva ROC
+auc <- roc(val$Label, predictionValidationProb[["Yes"]], levels = unique(val[["Label"]]))
+roc_validation <- plot.roc(auc, 
+                           ylim=c(0,1), 
+                           type = "S" , 
+                           print.thres = TRUE, 
+                           main=paste('Validation AUC:', round(auc$auc[[1]], 2)))
+```
+
+### Conjunto de datos train1_down
+
+```{r}
+# Entrenar modelo
+rpartModel <- train(Label ~ ., 
+                    data = train1_down, 
+                    method = "rpart", 
+                    metric = "Accuracy", 
+                    trControl = rpartCtrl, 
+                    tuneGrid = rpartParametersGrid)
+
+# Predicciones con clases
+prediction <- predict(rpartModel, val1, type = "raw") 
+
+# Predicciones con probabilidades
+predictionValidationProb <- predict(rpartModel, val1, type = "prob")
+
+# Matriz de confusión
+cm_train <- confusionMatrix(prediction, val1[["Label"]])
+cm_train
+
+# Curva ROC
+auc <- roc(val1$Label, predictionValidationProb[["Yes"]], levels = unique(val1[["Label"]]))
+roc_validation <- plot.roc(auc, 
+                           ylim=c(0,1), 
+                           type = "S" , 
+                           print.thres = TRUE, 
+                           main=paste('Validation AUC:', round(auc$auc[[1]], 2)))
+```
+
+### Conjunto de datos train2_down
+
+```{r}
+# Entrenar modelo
+rpartModel <- train(Label ~ ., 
+                    data = train2_down, 
+                    method = "rpart", 
+                    metric = "Accuracy", 
+                    trControl = rpartCtrl, 
+                    tuneGrid = rpartParametersGrid)
+
+# Predicciones con clases
+prediction <- predict(rpartModel, val2, type = "raw") 
+
+# Predicciones con probabilidades
+predictionValidationProb <- predict(rpartModel, val2, type = "prob")
+
+# Matriz de confusión
+cm_train <- confusionMatrix(prediction, val2[["Label"]])
+cm_train
+
+# Curva ROC
+auc <- roc(val2$Label, predictionValidationProb[["Yes"]], levels = unique(val2[["Label"]]))
+roc_validation <- plot.roc(auc, 
+                           ylim=c(0,1), 
+                           type = "S" , 
+                           print.thres = TRUE, 
+                           main=paste('Validation AUC:', round(auc$auc[[1]], 2)))
+```
+
+## kNN
+
+El valor de k escogido es de k=5.
+
+### Conjunto de datos train
+
+```{r}
+library("kknn")
+# Entrenar modelo
+knn=kknn(formula=Label ~ .,train,val,k=5)
+table=table(knn$fit,val$Label)
+table
+# Cálculo porcentaje de aciertos
+diag=diag(table)
+bien_clasificados=(sum(diag)/nrow(val))*100
+bien_clasificados
+# Predicción y curva ROC
+library("ROCR")
+m1=knn$prob[,2]
+pred=prediction(m1,val$Label)
+perf=performance(pred,"tpr","fpr")
+auc=as.numeric(performance(pred, "auc")@y.values)
+plot(perf, main=paste('Validation AUC:', round(auc, 2)))
+
+```
+
+### Conjunto de datos train1_down
+
+```{r}
+# Entrenar modelo
+knn=kknn(formula=Label ~ .,train1_down,val1,k=5)
+table=table(knn$fit,val1$Label)
+
+# Calculo porcentaje de aciertos
+diag=diag(table)
+bien_clasificados=(sum(diag)/nrow(val1))*100
+
+# Predicción y curva ROC
+m1=knn$prob[,2]
+pred=prediction(m1,val1$Label)
+perf=performance(pred,"tpr","fpr")
+auc=as.numeric(performance(pred, "auc")@y.values)
+plot(perf, main=paste('Validation AUC:', round(auc, 2)))
+```
+
+### Conjunto de datos train2_down
+
+```{r}
+# Entrenar modelo
+knn=kknn(formula=Label ~ .,train2_down,val2,k=5)
+table=table(knn$fit,val2$Label)
+
+# Calculo porcentaje de aciertos
+diag=diag(table)
+bien_clasificados=(sum(diag)/nrow(val2))*100
+
+# Predicción y curva ROC
+m1=knn$prob[,2]
+pred=prediction(m1,val2$Label)
+perf=performance(pred,"tpr","fpr")
+auc=as.numeric(performance(pred, "auc")@y.values)
+plot(perf, main=paste('Validation AUC:', round(auc, 2)))
+```

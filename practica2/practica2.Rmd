@@ -1,0 +1,490 @@
+---
+title: "Práctica 2: Deep Learning para clasificación"
+author: 
+  - Juan Manuel Castillo Nievas
+  - Guillermo Bueno Vargas
+date: "5/6/2021"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(keras)
+library(caret)
+library(mice)
+library(rpart.plot)
+library(scales)
+set.seed(0)
+```
+
+# Lectura y visualización de datos
+
+```{r, fig.align='center', echo=FALSE}
+img_sample <- image_load(path = './data/images/medium10000_twoClasses/test/1/2euhha.jpg', 
+                         target_size = c(150, 150))
+img_sample_array <- array_reshape(image_to_array(img_sample), c(1, 150, 150, 3))
+plot(as.raster(img_sample_array[1,,,] / 255))
+```
+
+# Analisis Explotatorio de Datos (EDA)
+
+Directorios:
+
+```{r}
+dataset_dir           <- './data/images/medium10000_twoClasses'
+train_images_dir      <- paste0(dataset_dir, '/train')
+val_images_dir        <- paste0(dataset_dir, '/val')
+test_images_dir       <- paste0(dataset_dir, '/test')
+comments_file         <- './data/comments/all_comments.tsv'
+```
+
+Metadatos:
+
+```{r}
+metadata_train <- read_tsv(paste0(train_images_dir, "/multimodal_train.tsv"))
+metadata_train <- metadata_train %>%
+  mutate(created_at = as.POSIXct(created_utc, origin="1970-01-01")) %>%
+  select(-one_of('created_utc')) %>%
+  mutate(class = ifelse(`2_way_label` == 0, 'Disinformation', 'Other'))
+```
+
+Comentarios:
+
+```{r, eval=FALSE}
+comments <- read_tsv(comments_file)
+```
+
+Se exploran los comentarios y se observa que hay un valores NA, con una suma de 1094552 y una media de 0.01367892
+
+```{r,  eval=FALSE}
+summary(comments)
+sum(is.na(comments))
+mean(is.na(comments))
+```
+
+Para trabajar mejor con esto, se va a prodecer a limpiar estos datos:
+
+```{r, eval=FALSE}
+comments <- comments %>%
+  drop_na()
+sum(is.na(comments))
+```
+# Combinar datos
+`left_join()` de la tabla de metadatos y de los comentarios:
+
+```{r, eval=FALSE}
+metadata_train_comments <- left_join(x = metadata_train, y = comments, 
+                                     by = c("id" = "submission_id"),
+                                     keep = FALSE,
+                                     suffix = c('.publication', '.comment'))
+
+metadata_train_comments
+```
+
+# Análisis exploratorio simple
+
+## Distribución de clases
+
+Seleccionar datos:
+
+```{r, eval=FALSE}
+data_binary <- metadata_train %>%
+  select(-one_of('3_way_label', '6_way_label', '2_way_label'))
+```
+
+La siguiente figura muestra cómo de distribuidas están ambas clases
+
+```{r, eval=FALSE}
+table(data_binary$class)
+
+ggplot(data_binary) +
+  geom_histogram(aes(x = class, fill = class), stat = 'count')
+```
+
+Para entrenar los modelos de una mejor forma, se debería de balancear los datos. En este caso se ha elegido downsampling, para reducir los datos y posiblemente se ejecute más rápido el proceso. 
+
+```{r, eval=FALSE}
+data_factor <- data_binary
+data_factor$class <- as.factor(data_factor$class)
+predictors <- select(data_factor, -class) 
+data_downSample <- downSample(x = predictors,
+                             y=data_factor$class, yname='class')
+```
+
+La siguiente figura muestra muestra que las clases están balanceadas:
+
+```{r, eval=FALSE}
+table(data_downSample$class)
+
+ggplot(data_downSample) +
+  geom_histogram(aes(x = class, fill = class), stat = 'count')
+```
+
+Es sorprendente el incremento de número de noticias falsas que se ha dado durante los últimos 10 años.
+
+```{r, eval=FALSE}
+ggplot(metadata_train, aes(x = created_at)) +
+  geom_histogram(aes(fill = class))
+```
+
+Número de comentarios por post con más desinformación:
+
+```{r, eval=FALSE}
+plotdata <- data_binary %>%
+  filter(class == "Disinformation") %>%
+  count(num_comments) %>%
+  slice_max(n = 25, order_by = n, with_ties = FALSE)
+  
+ggplot(plotdata) +
+  geom_bar(aes(x = num_comments, y = n), stat = 'identity') +
+  coord_flip()
+```
+
+Subreddits con más desinformación:
+
+```{r, eval=FALSE}
+plotdata <- data_binary %>%
+  filter(class == "Disinformation") %>%
+  count(subreddit) %>%
+  slice_max(n = 25, order_by = n, with_ties = FALSE)
+  
+ggplot(plotdata) +
+  geom_bar(aes(x = subreddit, y = n), stat = 'identity') +
+  coord_flip()
+```
+
+# Análisis de información en los títulos de las noticias
+
+Información de los títulos de las noticias: exclamaciones, mayúsculas, dígitos y emojis.
+
+```{r, eval=FALSE}
+data_binary_extended <- data_binary %>%
+  mutate(title_text_exclamations = str_count(title, "!")) %>%
+  mutate(title_text_caps = str_count(title, "[A-Z]")) %>%
+  mutate(title_text_digits = str_count(title, "[0-9]")) %>%
+  mutate(title_text_emojis = str_count(title, '[\U{1F300}-\U{1F6FF}]')) %>%
+  mutate(title_text_emoji_flag = str_count(title, '\U{1F1FA}|\U{1F1F8}]'))
+```
+
+Distribución de densidad de número de exclamaciones en los títulos.
+
+```{r, eval=FALSE}
+ggplot(data_binary_extended) + 
+  geom_density(aes(x=title_text_exclamations, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de mayúsculas en los títulos.
+
+```{r, eval=FALSE}
+ggplot(data_binary_extended) + 
+  geom_density(aes(x=title_text_caps, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de números en los títulos.
+
+```{r, eval=FALSE}
+ggplot(data_binary_extended) + 
+  geom_density(aes(x=title_text_digits, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de emojis en los títulos.
+
+```{r, eval=FALSE}
+ggplot(data_binary_extended) + 
+  geom_density(aes(x=title_text_emojis, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+# Análisis de información en el cuerpo de las noticias
+
+```{r, eval=FALSE}
+data_binary_comments <- metadata_train_comments %>%
+  select(-one_of('3_way_label', '6_way_label', '2_way_label'))
+
+data_binary_comments_extended <- data_binary_comments %>%
+  mutate(body_text_exclamations = str_count(body, "!")) %>%
+  mutate(body_text_caps = str_count(body, "[A-Z]")) %>%
+  mutate(body_text_has_punctuation = str_count(body, "[.,:;]")) %>%
+  mutate(body_text_digits = str_count(body, "[0-9]")) %>%
+  mutate(body_text_emojis = str_count(body, '[\U{1F300}-\U{1F6FF}]')) %>%
+  mutate(body_text_emoji_flag = str_count(body, '\U{1F1FA}|\U{1F1F8}]'))
+```
+
+Distribución de densidad de número de exclamaciones en el cuerpo de las noticias.
+
+```{r, eval=FALSE}
+ggplot(data_binary_comments_extended) + 
+  geom_density(aes(x=body_text_exclamations, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de mayúsculas en el cuerpo de las noticias.
+
+```{r, eval=FALSE}
+ggplot(data_binary_comments_extended) + 
+  geom_density(aes(x=body_text_caps, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de signos de puntuación en el cuerpo de las noticias.
+
+```{r, eval=FALSE}
+ggplot(data_binary_comments_extended) + 
+  geom_density(aes(x=body_text_has_punctuation, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de dígitos en el cuerpo de las noticias.
+
+```{r, eval=FALSE}
+ggplot(data_binary_comments_extended) + 
+  geom_density(aes(x=body_text_digits, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+Distribución de densidad de número de emojis en el cuerpo de las noticias.
+
+```{r, eval=FALSE}
+ggplot(data_binary_comments_extended) + 
+  geom_density(aes(x=body_text_emojis, color=class, fill=class), alpha = 0.5)  +
+  scale_x_continuous(trans="log10")
+```
+
+# Modelos de clasificación
+
+```{r}
+train_images_generator <- image_data_generator(rescale = 1/255)
+val_images_generator   <- image_data_generator(rescale = 1/255)
+test_images_generator  <- image_data_generator(rescale = 1/255)
+```
+
+## Flujo de datos para alimentar el modelo
+
+```{r}
+train_generator_flow <- flow_images_from_directory(
+  directory = train_images_dir,
+  generator = train_images_generator,
+  class_mode = 'categorical',
+  batch_size = 128,
+  target_size = c(64, 64)         # (w x h) --> (64 x 64)
+)
+
+validation_generator_flow <- flow_images_from_directory(
+  directory = val_images_dir,
+  generator = val_images_generator,
+  class_mode = 'categorical',
+  batch_size = 128,
+  target_size = c(64, 64)         # (w x h) --> (64 x 64)
+)
+
+test_generator_flow <- flow_images_from_directory(
+  directory = test_images_dir,
+  generator = test_images_generator,
+  class_mode = 'categorical',
+  batch_size = 128,
+  target_size = c(64, 64)         # (w x h) --> (64 x 64)
+)
+```
+
+## Modelo propuesto por el profesor:
+ 
+```{r}
+modelo_profesor <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = "relu") %>%
+  layer_dense(units = 2, activation = "softmax")
+```
+
+```{r}
+modelo_profesor %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+```
+
+```{r}
+ start_time <- Sys.time()
+  history <- modelo_profesor %>% 
+  fit_generator(
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    epochs = 10
+  )
+ end_time <- Sys.time()
+  plot(history)
+  metrics <- modelo_profesor %>% 
+    evaluate_generator(test_generator_flow, steps = 5)
+
+  time <- (end_time - start_time)
+  precision <- precision + as.numeric(metrics[2])
+  loss <- loss + as.numeric(metrics[1])
+  message(time)
+  message(precision)
+  message(loss)
+```
+
+## Modelo propuesto
+
+```{r}
+modeloPropuesto <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 16, kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 8, kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 1024, activation = "relu") %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dense(units = 2, activation = "softmax")
+```
+
+```{r}
+modeloPropuesto %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+
+```
+
+```{r}
+ start_time <- Sys.time()
+  history <- modeloPropuesto %>% 
+  fit_generator(
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    epochs = 10
+  )
+ end_time <- Sys.time()
+  plot(history)
+  metrics <- modeloPropuesto %>% 
+    evaluate_generator(test_generator_flow, steps = 5)
+
+  time <- (end_time - start_time)
+  precision <- precision + as.numeric(metrics[2])
+  loss <- loss + as.numeric(metrics[1])
+  message(time)
+  message(precision)
+  message(loss)
+```
+
+## Mejora de la red propuesta
+
+Cambiamos la activacion de relu a sigmoide y viceversa 
+
+```{r}
+modeloPropuestoMejorado <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "sigmoid", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "sigmoid") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 16, kernel_size = c(3, 3), activation = "sigmoid") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_conv_2d(filters = 8, kernel_size = c(3, 3), activation = "sigmoid") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 1024, activation = "sigmoid") %>%
+  layer_dense(units = 256, activation = "sigmoid") %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dense(units = 2, activation = "softmax")
+```
+
+```{r}
+modeloPropuestoMejorado %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+```
+
+```{r}
+start_time <- Sys.time()
+  history <- modeloPropuestoMejorado %>% 
+  fit_generator(
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    epochs = 10
+  )
+ end_time <- Sys.time()
+  plot(history)
+  metrics <- modeloPropuestoMejorado %>% 
+    evaluate_generator(test_generator_flow, steps = 5)
+
+  time <- (end_time - start_time)
+  precision <- precision + as.numeric(metrics[2])
+  loss <- loss + as.numeric(metrics[1])
+  message(time)
+  message(precision)
+  message(loss)
+
+```
+
+## Modelo final mejorado
+
+Se añade el dropout y el batch normalization
+
+```{r}
+modeloFinal <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 64,  kernel_size = c(3, 3), activation = "relu", input_shape = c(64, 64, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_batch_normalization() %>%
+  layer_conv_2d(filters = 32,  kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_batch_normalization() %>%
+  layer_conv_2d(filters = 16, kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_batch_normalization() %>%
+  layer_conv_2d(filters = 8, kernel_size = c(3, 3), activation = "relu") %>% layer_max_pooling_2d(pool_size = c(2, 2)) %>%
+  layer_batch_normalization() %>%
+  layer_flatten() %>%
+  layer_dense(units = 1024, activation = "relu") %>%
+  layer_dropout(0.5) %>%
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_dropout(0.5) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(0.5) %>%
+  layer_dense(units = 2, activation = "softmax")
+```
+
+```{r}
+modeloFinal %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_rmsprop(),
+  metrics = c('accuracy')
+)
+```
+
+```{r}
+start_time <- Sys.time()
+  history <- modeloFinal %>% 
+  fit_generator(
+    generator = train_generator_flow, 
+    validation_data = validation_generator_flow,
+    steps_per_epoch = 10,
+    epochs = 10
+  )
+ end_time <- Sys.time()
+  plot(history)
+  metrics <- modeloFinal %>% 
+    evaluate_generator(test_generator_flow, steps = 5)
+
+  time <- (end_time - start_time)
+  precision <- precision + as.numeric(metrics[2])
+  loss <- loss + as.numeric(metrics[1])
+  message(time)
+  message(precision)
+  message(loss)
+```
